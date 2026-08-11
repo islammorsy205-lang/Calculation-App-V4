@@ -64,6 +64,7 @@ if not st.session_state.get("is_admin", False) and "welcome_msg_shown" not in st
 
 auth.render_admin_dashboard()
 
+# إخفاء الترحيب في شريط جانبي صغير بدلاً من الأزرار
 with st.sidebar:
     st.markdown("<h1 style='color: #E10000; font-weight: bold; letter-spacing: 2px;'>ACROW</h1>", unsafe_allow_html=True)
     st.markdown("---")
@@ -71,53 +72,54 @@ with st.sidebar:
         st.markdown(f"### 🟢 Active Users: **{auth.track_active_users()}**")
     else: 
         st.markdown(f"#### Welcome {st.session_state.get('user_name', 'User')} 👋")
-        
-    # ==========================================
-    # 💾 LOAD PROJECT SYSTEM
-    # ==========================================
-    st.markdown("### 📂 Project Management")
-    uploaded_proj = st.file_uploader("Load Project (.acrow)", type=['acrow', 'json'])
-    if uploaded_proj is not None:
-        if st.button("🔄 Restore Project Data", type="primary", use_container_width=True):
-            try:
-                saved_data = json.load(uploaded_proj)
-                for k, v in saved_data.items():
-                    st.session_state[k] = v
-                st.success("✅ Loaded! (Clear file uploader to avoid loop)")
-                st.rerun()
-            except Exception as e:
-                st.error("❌ Invalid Project File!")
-    st.markdown("---")
 
 # ==========================================
-# 3. Project Details UI
+# 💾 3. PROJECT MANAGEMENT (SAVE & LOAD) - MOVED TO MAIN UI
 # ==========================================
-proj_name, contractor, calc_sub, sys_name, proj_no, calc_by, date_val, chk_by, ref_code, cover_img, data_sheets, def_sec, def_main = render_project_details()
-
-# ==========================================
-# 💾 SAVE PROJECT SYSTEM (Dynamic Naming)
-# ==========================================
-with st.sidebar:
-    def get_savable_state():
-        safe_state = {}
-        for k, v in st.session_state.items():
-            # حفظ القيم الأساسية فقط وتجاهل الملفات المعقدة
-            if isinstance(v, (int, float, str, list, dict, bool)) and not k.startswith("FormSubmitter"):
-                safe_state[k] = v
-        return json.dumps(safe_state, indent=4)
-        
-    # تنظيف اسم الـ Calculation Subject عشان ينفع يكون اسم ملف
-    safe_name = "".join(c for c in str(calc_sub) if c.isalnum() or c in " _-").strip()
-    if not safe_name: safe_name = "Acrow_Project"
+with st.container(border=True):
+    st.markdown("### 💾 Project Management (Save & Load)")
+    c_load, c_save = st.columns(2)
     
-    st.download_button(
-        label="💾 Save Current Project",
-        data=get_savable_state(),
-        file_name=f"{safe_name}.acrow",
-        mime="application/json",
-        use_container_width=True
-    )
-    st.markdown("---")
+    with c_load:
+        uploaded_proj = st.file_uploader("📂 Load Project File (.acrow / .json)", type=['acrow', 'json'])
+        if uploaded_proj is not None:
+            if st.button("🔄 Restore Project Data", type="primary", use_container_width=True):
+                try:
+                    saved_data = json.load(uploaded_proj)
+                    for k, v in saved_data.items():
+                        st.session_state[k] = v
+                    st.success("✅ Project Loaded! (Please clear the file uploader to avoid loops)")
+                    st.rerun()
+                except Exception as e:
+                    st.error("❌ Invalid Project File!")
+                    
+    with c_save:
+        def get_savable_state():
+            safe_state = {}
+            for k, v in st.session_state.items():
+                if isinstance(v, (int, float, str, list, dict, bool)) and not k.startswith("FormSubmitter"):
+                    safe_state[k] = v
+            return json.dumps(safe_state, indent=4)
+            
+        # سحب اسم المشروع المحفوظ في الذاكرة لتسمية الملف، أو استخدام اسم افتراضي
+        calc_sub_name = st.session_state.get("ui_calc_subject", "Acrow_Project")
+        safe_name = "".join(c for c in str(calc_sub_name) if c.isalnum() or c in " _-").strip()
+        if not safe_name: safe_name = "Acrow_Project"
+        
+        st.markdown("<div style='margin-top: 28px;'></div>", unsafe_allow_html=True)
+        st.download_button(
+            label="💾 Save Current Project",
+            data=get_savable_state(),
+            file_name=f"{safe_name}.acrow",
+            mime="application/json",
+            use_container_width=True
+        )
+
+# ==========================================
+# 4. Project Details UI
+# ==========================================
+st.markdown("---")
+proj_name, contractor, calc_sub, sys_name, proj_no, calc_by, date_val, chk_by, ref_code, cover_img, data_sheets, def_sec, def_main = render_project_details()
 
 # ==========================================
 # SMART INITIALS LOGIC 
@@ -145,7 +147,7 @@ elif not calc_by or calc_by == "Eng. ":
 def_live_load = 1.50 if "BS" in ref_code else 2.40
 
 # ==========================================
-# 4. Structural System Configurator
+# 5. Structural System Configurator
 # ==========================================
 st.divider()
 st.subheader("2. Structural System Configurator")
@@ -215,7 +217,7 @@ else:
             configs.append(conf)
 
 # ==========================================
-# 5. Global Buttons & Action Handlers
+# 6. Global Buttons & Action Handlers
 # ==========================================
 st.divider()
 st.warning("⚠️ **تنبيه:** يرجى مراجعة وتأكيد تطابق البيانات الأساسية مع العناصر المدخلة قبل استخراج النوتة الحسابية.")
@@ -324,7 +326,7 @@ if check_safety_btn:
         elif not has_valid_configs: st.info("No calculable sections found. Please configure a valid system first.")
 
 # ==========================================
-# 6. Generate Document (The Output Engine)
+# 7. Generate Document (The Output Engine)
 # ==========================================
 if generate_doc_btn:
     errors = [c for c in configs if not c.get('is_panel_system') and c.get('cat') == 'horizontal' and (c.get("s_cr", 0) < -0.01 or c.get("m_cr", 0) < -0.01)]
