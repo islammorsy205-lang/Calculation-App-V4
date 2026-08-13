@@ -9,3 +9,4 @@ gspread
 starlette==0.37.2
 ezdxf
 pytesseract
+extra-streamlit-components
