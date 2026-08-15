@@ -334,22 +334,43 @@ if "Slab Elements" in sys_cat:
     gamma_c = cg1.number_input("Conc. Density (kN/m³)", value=25.0)
     live_load = cg2.number_input("Live Load (kN/m²)", value=float(def_live_load), step=0.05)
     fw_load = cg3.number_input("Formwork Load (kN/m²)", value=0.50, step=0.05)
-    num_elements = cg4.number_input("Number of Elements", min_value=1, max_value=5, value=1)
+    
+    # 💡 تم إزالة الحد الأقصى max_value=5 ليكون العدد مفتوحاً
+    num_elements = cg4.number_input("Number of Elements", min_value=1, value=1)
     
     tabs = st.tabs([f"Element {i+1}" for i in range(int(num_elements))])
     for i, tab in enumerate(tabs):
+        # 💡 الاستنساخ الذكي: إذا كان هذا العنصر يُفتح لأول مرة، ينسخ بيانات العنصر الذي قبله مباشرة
+        if i > 0 and f"etype_{i}" not in st.session_state:
+            for key, val in st.session_state.items():
+                if key.endswith(f"_{i-1}") and not key.startswith("tgl_diag_"):
+                    new_key = key.rsplit(f"_{i-1}", 1)[0] + f"_{i}"
+                    if new_key not in st.session_state:
+                        st.session_state[new_key] = val
+
         with tab:
             conf = render_slab_element(i, gamma_c, live_load, fw_load, def_sec, def_main)
             conf['gamma_c'] = gamma_c
             conf['live_load'] = live_load
             conf['fw_load'] = fw_load
             configs.append(conf)
+            
 else:
     element_subtype = st.radio("Element Type:", ["Wall", "Column"], horizontal=True)
-    num_elements = st.number_input(f"Number of {element_subtype}s", min_value=1, max_value=5, value=1)
+    
+    # 💡 تم إزالة الحد الأقصى max_value=5 ليكون العدد مفتوحاً
+    num_elements = st.number_input(f"Number of {element_subtype}s", min_value=1, value=1)
     
     tabs = st.tabs([f"{element_subtype} {i+1}" for i in range(int(num_elements))])
     for i, tab in enumerate(tabs):
+        # 💡 الاستنساخ الذكي للعناصر الرأسية أيضاً (ينسخ من العنصر السابق i-1)
+        if i > 0 and f"vsys_{i}" not in st.session_state:
+            for key, val in st.session_state.items():
+                if key.endswith(f"_{i-1}") and not key.startswith("tgl_diag_"):
+                    new_key = key.rsplit(f"_{i-1}", 1)[0] + f"_{i}"
+                    if new_key not in st.session_state:
+                        st.session_state[new_key] = val
+
         with tab:
             conf = render_vertical_element(i, element_subtype, def_sec, def_main)
             configs.append(conf)
@@ -372,6 +393,7 @@ if check_safety_btn:
         st.error("❌ Error: Spans exceed total length. Please fix geometry first.")
     else:
         st.markdown("### 🛡️ Pre-Check Safety Results")
+        from math_solver import perform_global_safety_check
         all_safe = perform_global_safety_check(configs) 
         has_valid_configs = False
         
@@ -467,6 +489,7 @@ if check_safety_btn:
 # 10. Generate Document (The Output Engine)
 # ==========================================
 if generate_doc_btn:
+    from math_solver import perform_global_safety_check
     errors = [c for c in configs if not c.get('is_panel_system') and c.get('cat') == 'horizontal' and (c.get("s_cr", 0) < -0.01 or c.get("m_cr", 0) < -0.01)]
     tilt_len_errors = [c for c in configs if c.get('cat') == 'vertical' and c.get('tilting', {}).get('active') and not c.get('tilting', {}).get('length_safe', True)]
     
