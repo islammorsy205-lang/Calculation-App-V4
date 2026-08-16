@@ -145,7 +145,6 @@ def parse_dxf_bridge_cases(file_bytes, loaded_width, conc_density):
                             if a_m: c['a_texts'].append({'idx': int(a_m.group(1)), 'val': float(a_m.group(2)), 'x': x_cad})
                         break
 
-        # معالجة كل حالة (Case) وتحويلها لموديل FEA متكامل
         processed_cases = []
         for c_idx, c in enumerate(cases_raw):
             if not c['s_texts']: continue
@@ -204,7 +203,7 @@ def parse_dxf_bridge_cases(file_bytes, loaded_width, conc_density):
             except: pass
 
 # =========================================================
-# 2. Meshing & FEA Matrix Engine (From Advanced Module)
+# 2. Meshing & FEA Matrix Engine
 # =========================================================
 def build_chain_mesh(segments, sec_props, loads, supports, mesh_size=0.25):
     nodes = []
@@ -223,7 +222,6 @@ def build_chain_mesh(segments, sec_props, loads, supports, mesh_size=0.25):
     
     for sup in supports:
         sx, sy = sup['x'], sup['y']
-        # Snap to closest segment
         min_d, w_seg, w_s = 999.0, 0, 0.0
         for i, seg in enumerate(segments):
             p1, p2 = np.array(seg['abs_p1']), np.array(seg['abs_p2'])
@@ -430,14 +428,15 @@ def plot_sap2000_diagrams(nodes, elements, R_reactions, scales, supports_list, l
             draw_reaction_arrow(ax_r, x, y, R_loc_y, -math.sin(ang), math.cos(ang))
     figs_dict['R'] = safe_render_fig(fig_r)
     
-    # 3. Forces (N, V, M)
+    # 3. Forces (N, V, M) - 💡 FIXED THE TYPO HERE (n1, n2 defined explicitly)
     def create_force_plot(val_key, scale, c_pos, c_neg):
         fig_f, ax_f = plt.subplots(figsize=(7, 4.5))
         ax_f.set_aspect('equal', adjustable='box'); ax_f.axis('off')
         draw_base_geometry(ax_f, nodes, elements, supports_list, segments)
         for el in elements:
-            x1, y1 = nodes[el['n1']][0], nodes[el['n1']][1]
-            x2, y2 = nodes[el['n2']][0], nodes[n2][1]
+            n1, n2 = el['n1'], el['n2'] # <--- BUG FIXED HERE
+            x1, y1 = nodes[n1][0], nodes[n1][1]
+            x2, y2 = nodes[n2][0], nodes[n2][1]
             c, s = el.get('c', 1.0), el.get('s', 0.0)
             xs = el.get('internal', {}).get('x', [])
             vals = el.get('internal', {}).get(val_key, [])
