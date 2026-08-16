@@ -100,7 +100,7 @@ def get_closest_segment_exact(pt, segs):
     return min_d, best_idx, best_s
 
 # =========================================================
-# 1. THE ADVANCED DXF PARSER (Strict Layers & mm to m)
+# 1. THE ADVANCED DXF PARSER (Polylines, Blocks & Strict Layers)
 # =========================================================
 def parse_dxf_bridge_cases(file_bytes, loaded_width, conc_density):
     if ezdxf is None: return None
@@ -116,7 +116,6 @@ def parse_dxf_bridge_cases(file_bytes, loaded_width, conc_density):
         doc = ezdxf.readfile(tmp_path)
         msp = doc.modelspace()
         
-        # الطبقات الصارمة كما طلب الاستشاري
         layer_supp = 'SUPPORT'
         layer_text = 'TEXT_DATA'
         layer_sep = 'SEPARATOR'
@@ -126,7 +125,7 @@ def parse_dxf_bridge_cases(file_bytes, loaded_width, conc_density):
         separators = []
         for e in msp:
             if e.dxftype() == 'LINE' and e.dxf.layer.upper() == layer_sep:
-                separators.append((e.dxf.start.x + e.dxf.end.x) / 2000.0) # mm to m
+                separators.append((e.dxf.start.x + e.dxf.end.x) / 2000.0) 
                 
         separators.sort()
         separators = [-999999.0] + separators + [999999.0]
@@ -143,51 +142,59 @@ def parse_dxf_bridge_cases(file_bytes, loaded_width, conc_density):
             dxftype = e.dxftype()
             
             x_cad, y_cad = 0, 0
-            is_valid_point_text = False
+            is_valid_point = False
             
-            # فلترة النقاط والنصوص
+            # 💡 الجراحة 1: قراءة النقاط والدوائر والبلوكات (Insert)
             if dxftype in ['POINT', 'CIRCLE']:
                 x_cad = (e.dxf.location.x if dxftype=='POINT' else e.dxf.center.x) / 1000.0
                 y_cad = (e.dxf.location.y if dxftype=='POINT' else e.dxf.center.y) / 1000.0
-                is_valid_point_text = True
-            elif dxftype in ['TEXT', 'MTEXT']:
+                is_valid_point = True
+            elif dxftype == 'INSERT':
                 x_cad, y_cad = e.dxf.insert.x / 1000.0, e.dxf.insert.y / 1000.0
-                is_valid_point_text = True
+                is_valid_point = True
                 
-            if is_valid_point_text:
+            if is_valid_point:
                 for c in cases_raw:
                     if c['min_x'] <= x_cad <= c['max_x']:
-                        if layer == layer_supp and dxftype in ['POINT', 'CIRCLE']:
+                        if layer == layer_supp:
                             c['supports'].append({'x': x_cad, 'y': y_cad})
-                        elif layer == layer_text and dxftype in ['POINT', 'CIRCLE']:
+                        elif layer == layer_text:
                             c['cut_points'].append({'x': x_cad, 'y': y_cad})
-                        elif layer == layer_text and dxftype in ['TEXT', 'MTEXT']:
-                            txt = e.text if dxftype == 'MTEXT' else e.dxf.text
-                            txt = txt.upper().replace('\n', '').replace('\r', '')
-                            s_m = re.search(r'S(\d+)\s*=\s*([\d\.]+)', txt)
-                            a_m = re.search(r'A(\d+)\s*=\s*([\d\.]+)', txt)
-                            if s_m: c['s_texts'].append({'idx': int(s_m.group(1)), 'val': float(s_m.group(2)), 'x': x_cad, 'y': y_cad})
-                            if a_m: c['a_texts'].append({'idx': int(a_m.group(1)), 'val': float(a_m.group(2)), 'x': x_cad, 'y': y_cad})
-                        break
-            
-            # فلترة الخطوط (Frames & Struts)
-            elif dxftype == 'LINE':
-                x1, y1 = e.dxf.start.x / 1000.0, e.dxf.start.y / 1000.0
-                x2, y2 = e.dxf.end.x / 1000.0, e.dxf.end.y / 1000.0
-                mid_x = (x1 + x2) / 2.0
-                
-                for c in cases_raw:
-                    if c['min_x'] <= mid_x <= c['max_x']:
-                        if layer == layer_frame:
-                            c['frames'].append({'x1': x1, 'y1': y1, 'x2': x2, 'y2': y2})
-                        elif layer == layer_strut:
-                            c['struts'].append({'x1': x1, 'y1': y1, 'x2': x2, 'y2': y2})
                         break
 
-        # معالجة كل حالة وتحويلها لبيانات FEA
+            # 💡 الجراحة 2: قراءة النصوص بذكاء واحتواء المسافات
+            elif dxftype in ['TEXT', 'MTEXT']:
+                x_cad, y_cad = e.dxf.insert.x / 1000.0, e.dxf.insert.y / 1000.0
+                for c in cases_raw:
+                    if c['min_x'] <= x_cad <= c['max_x'] and layer == layer_text:
+                        txt = e.text if dxftype == 'MTEXT' else e.dxf.text
+                        txt = txt.upper().replace('\n', '').replace('\r', '')
+                        s_m = re.search(r'S\s*(\d+)\s*=\s*([\d\.]+)', txt)
+                        a_m = re.search(r'A\s*(\d+)\s*=\s*([\d\.]+)', txt)
+                        if s_m: c['s_texts'].append({'idx': int(s_m.group(1)), 'val': float(s_m.group(2)), 'x': x_cad, 'y': y_cad})
+                        if a_m: c['a_texts'].append({'idx': int(a_m.group(1)), 'val': float(a_m.group(2)), 'x': x_cad, 'y': y_cad})
+                        break
+            
+            # 💡 الجراحة 3: تفجير الـ Polylines إلى Lines صريحة لمنع اختفاء الإطارات
+            elif dxftype in ['LINE', 'LWPOLYLINE', 'POLYLINE']:
+                entities = list(e.virtual_entities()) if dxftype != 'LINE' else [e]
+                for sub_e in entities:
+                    if sub_e.dxftype() == 'LINE':
+                        x1, y1 = sub_e.dxf.start.x / 1000.0, sub_e.dxf.start.y / 1000.0
+                        x2, y2 = sub_e.dxf.end.x / 1000.0, sub_e.dxf.end.y / 1000.0
+                        mid_x = (x1 + x2) / 2.0
+                        
+                        for c in cases_raw:
+                            if c['min_x'] <= mid_x <= c['max_x']:
+                                if layer == layer_frame:
+                                    c['frames'].append({'x1': x1, 'y1': y1, 'x2': x2, 'y2': y2})
+                                elif layer == layer_strut:
+                                    c['struts'].append({'x1': x1, 'y1': y1, 'x2': x2, 'y2': y2})
+                                break
+
         processed_cases = []
         for c_idx, c in enumerate(cases_raw):
-            if not c['frames']: continue
+            if not c['frames']: continue # يتخطى الحالة فقط لو لم يجد أي رسمة
             
             base_segments = []
             for i, line in enumerate(c['frames']):
@@ -198,10 +205,9 @@ def parse_dxf_bridge_cases(file_bytes, loaded_width, conc_density):
                 })
                 
             loads = []
-            # دمج الـ S texts مع الـ Frames
             for s_txt in c['s_texts']:
                 min_d, best_idx, _ = get_closest_segment_exact((s_txt['x'], s_txt['y']), base_segments)
-                if min_d < 2.0: # حد أقصى للبحث عن الخط
+                if min_d < 2.0: 
                     base_segments[best_idx]['name'] = f"S{s_txt['idx']}"
                     
                     a_txt = next((a for a in c['a_texts'] if a['idx'] == s_txt['idx']), None)
@@ -213,7 +219,7 @@ def parse_dxf_bridge_cases(file_bytes, loaded_width, conc_density):
                             loads.append({
                                 'seg_idx': best_idx, 'category': 'Dead Load', 'type': 'Uniform',
                                 'dir': 'Global Y (Vertical)', 'start': 0.0, 'end': base_segments[best_idx]['L'],
-                                'w1': -abs(w_val), 'w2': -abs(w_val) # إجبار لأسفل Z/Y Negative
+                                'w1': -abs(w_val), 'w2': -abs(w_val) 
                             })
                             
             struts_mapped = []
@@ -262,7 +268,6 @@ def build_chain_mesh(segments, sec_props, loads, struts, supports, cut_points, m
     support_injections = {i: [] for i in range(len(segments))}
     supports_list_out = []
     
-    # ربط الركائز (Supports)
     for sup in supports:
         sx, sy = sup['x'], sup['y']
         min_d, w_seg, w_s = get_closest_segment_exact((sx, sy), segments)
@@ -270,13 +275,11 @@ def build_chain_mesh(segments, sec_props, loads, struts, supports, cut_points, m
         nid = get_or_add_node(sx, sy)
         supports_list_out.append({'node': nid, 'type': sup.get('type', 'Roller'), 'angle': sup.get('angle', 0.0)})
 
-    # ربط نقط القطع (TEXT_DATA points)
     for cp in cut_points:
         min_d, w_seg, w_s = get_closest_segment_exact((cp['x'], cp['y']), segments)
         if min_d < 0.30: support_injections[w_seg].append(w_s)
         get_or_add_node(cp['x'], cp['y'])
 
-    # ربط وتوليد النهايز (Struts)
     for st_idx, st_item in enumerate(struts):
         tx, ty, bx, by = st_item['tx'], st_item['ty'], st_item['bx'], st_item['by']
         
@@ -298,7 +301,6 @@ def build_chain_mesh(segments, sec_props, loads, struts, supports, cut_points, m
             'n1': bot_node, 'n2': top_node, 'E': 21000000.0, 'A': 0.001
         })
 
-    # بناء الفريمات (Main Members)
     for i, seg in enumerate(segments):
         L = seg['L']
         key_s_vals = [0.0, L] + support_injections[i]
@@ -473,7 +475,6 @@ def plot_sap2000_diagrams(nodes, elements, R_reactions, scales, supports_list, l
     apply_plot_styles()
     figs_dict = {}
     
-    # 1. Loads Diagram
     fig_ld, ax_ld = plt.subplots(figsize=(7, 4.5))
     ax_ld.set_aspect('equal', adjustable='datalim'); ax_ld.axis('off')
     draw_base_geometry(ax_ld, nodes, elements, supports_list, segments, show_names=True)
@@ -489,14 +490,13 @@ def plot_sap2000_diagrams(nodes, elements, R_reactions, scales, supports_list, l
             w_val = (w1 + (w2 - w1) * (sv - ld.get('start', 0)) / L_load) * 0.05
             poly_pts.append((px, py))
             c, s = math.cos(th), math.sin(th)
-            top_pts.append((px + s * w_val, py - c * w_val)) # Downward
+            top_pts.append((px + s * w_val, py - c * w_val)) 
         poly_pts.extend(top_pts[::-1])
         if len(poly_pts) > 2:
             ax_ld.add_patch(Polygon(poly_pts, facecolor='blue', edgecolor='blue', alpha=0.15, lw=0.8, zorder=2))
             
     figs_dict['L'] = safe_render_fig(fig_ld)
     
-    # 2. Reactions
     fig_r, ax_r = plt.subplots(figsize=(7, 4.5))
     ax_r.set_aspect('equal', adjustable='datalim'); ax_r.axis('off')
     draw_base_geometry(ax_r, nodes, elements, supports_list, segments)
@@ -512,12 +512,12 @@ def plot_sap2000_diagrams(nodes, elements, R_reactions, scales, supports_list, l
             
     figs_dict['R'] = safe_render_fig(fig_r)
     
-    # 3. Forces (N, V, M) - Fixed the Typo!
     def create_force_plot(val_key, scale, c_pos, c_neg):
         fig_f, ax_f = plt.subplots(figsize=(7, 4.5))
         ax_f.set_aspect('equal', adjustable='datalim'); ax_f.axis('off')
         draw_base_geometry(ax_f, nodes, elements, supports_list, segments)
         for el in elements:
+            # 💡 THE BUG FIXED DEFINITIVELY HERE:
             n1, n2 = el['n1'], el['n2'] 
             x1, y1 = nodes[n1][0], nodes[n1][1]
             x2, y2 = nodes[n2][0], nodes[n2][1]
