@@ -1,5 +1,5 @@
 # ==============================================================================
-# BRIDGE MASTER - DXF AI PARSER & ADVANCED FEA ENGINE
+# BRIDGE MASTER - TRUE 2D DXF PARSER & ADVANCED FEA ENGINE
 # ==============================================================================
 import streamlit as st
 import numpy as np
@@ -21,7 +21,7 @@ from docx.oxml import OxmlElement, parse_xml
 from docx.oxml.ns import nsdecls, qn
 
 from report_builder import insert_blue_banner, add_eq, append_pdf_stream_to_word
-from config import SECTIONS_DB
+from config import SECTIONS_DB, STRUTS_DB
 
 try:
     import ezdxf
@@ -80,8 +80,27 @@ def eval_seg_point(seg, s_val):
     th = math.atan2(p2[1] - p1[1], p2[0] - p1[0])
     return px, py, th
 
+def get_closest_segment_exact(pt, segs):
+    min_d, best_idx, best_s = 9999.0, 0, 0.0
+    px, py = pt[0], pt[1]
+    for idx, seg in enumerate(segs):
+        p1, p2 = seg['abs_p1'], seg['abs_p2']
+        x1, y1, x2, y2 = p1[0], p1[1], p2[0], p2[1]
+        dx, dy = x2 - x1, y2 - y1
+        L2 = dx*dx + dy*dy
+        if L2 == 0:
+            d = math.hypot(px - x1, py - y1)
+            if d < min_d: min_d, best_idx, best_s = d, idx, 0.0
+            continue
+        t = max(0, min(1, ((px - x1)*dx + (py - y1)*dy) / L2))
+        proj_x, proj_y = x1 + t*dx, y1 + t*dy
+        d = math.hypot(px - proj_x, py - proj_y)
+        if d < min_d:
+            min_d, best_idx, best_s = d, idx, t * math.hypot(dx, dy)
+    return min_d, best_idx, best_s
+
 # =========================================================
-# 1. THE ADVANCED DXF PARSER (Cases, Areas, and Loads)
+# 1. THE ADVANCED DXF PARSER (Strict Layers & mm to m)
 # =========================================================
 def parse_dxf_bridge_cases(file_bytes, loaded_width, conc_density):
     if ezdxf is None: return None
@@ -97,16 +116,17 @@ def parse_dxf_bridge_cases(file_bytes, loaded_width, conc_density):
         doc = ezdxf.readfile(tmp_path)
         msp = doc.modelspace()
         
-        # الطبقات المطلوبة
+        # الطبقات الصارمة كما طلب الاستشاري
         layer_supp = 'SUPPORT'
         layer_text = 'TEXT_DATA'
         layer_sep = 'SEPARATOR'
+        layer_frame = 'FRAME'
+        layer_strut = 'PUSH_PULL'
         
         separators = []
         for e in msp:
             if e.dxftype() == 'LINE' and e.dxf.layer.upper() == layer_sep:
-                # التحويل من مم إلى متر
-                separators.append((e.dxf.start.x + e.dxf.end.x) / 2000.0)
+                separators.append((e.dxf.start.x + e.dxf.end.x) / 2000.0) # mm to m
                 
         separators.sort()
         separators = [-999999.0] + separators + [999999.0]
@@ -115,81 +135,103 @@ def parse_dxf_bridge_cases(file_bytes, loaded_width, conc_density):
         for i in range(len(separators)-1):
             cases_raw.append({
                 'min_x': separators[i], 'max_x': separators[i+1],
-                'supports': [], 'points': [], 's_texts': [], 'a_texts': []
+                'frames': [], 'struts': [], 'supports': [], 'cut_points': [], 's_texts': [], 'a_texts': []
             })
             
         for e in msp:
-            x_cad, y_cad = 0, 0
-            is_valid = False
             layer = e.dxf.layer.upper()
+            dxftype = e.dxftype()
             
-            if e.dxftype() == 'POINT':
-                x_cad, y_cad = e.dxf.location.x / 1000.0, e.dxf.location.y / 1000.0
-                is_valid = True
-            elif e.dxftype() in ['TEXT', 'MTEXT']:
+            x_cad, y_cad = 0, 0
+            is_valid_point_text = False
+            
+            # فلترة النقاط والنصوص
+            if dxftype in ['POINT', 'CIRCLE']:
+                x_cad = (e.dxf.location.x if dxftype=='POINT' else e.dxf.center.x) / 1000.0
+                y_cad = (e.dxf.location.y if dxftype=='POINT' else e.dxf.center.y) / 1000.0
+                is_valid_point_text = True
+            elif dxftype in ['TEXT', 'MTEXT']:
                 x_cad, y_cad = e.dxf.insert.x / 1000.0, e.dxf.insert.y / 1000.0
-                is_valid = True
+                is_valid_point_text = True
                 
-            if is_valid:
+            if is_valid_point_text:
                 for c in cases_raw:
                     if c['min_x'] <= x_cad <= c['max_x']:
-                        if e.dxftype() == 'POINT' and layer == layer_supp:
+                        if layer == layer_supp and dxftype in ['POINT', 'CIRCLE']:
                             c['supports'].append({'x': x_cad, 'y': y_cad})
-                        elif e.dxftype() == 'POINT' and layer == layer_text:
-                            c['points'].append({'x': x_cad, 'y': y_cad})
-                        elif e.dxftype() in ['TEXT', 'MTEXT'] and layer == layer_text:
-                            txt = e.dxf.text.upper()
+                        elif layer == layer_text and dxftype in ['POINT', 'CIRCLE']:
+                            c['cut_points'].append({'x': x_cad, 'y': y_cad})
+                        elif layer == layer_text and dxftype in ['TEXT', 'MTEXT']:
+                            txt = e.text if dxftype == 'MTEXT' else e.dxf.text
+                            txt = txt.upper().replace('\n', '').replace('\r', '')
                             s_m = re.search(r'S(\d+)\s*=\s*([\d\.]+)', txt)
                             a_m = re.search(r'A(\d+)\s*=\s*([\d\.]+)', txt)
-                            if s_m: c['s_texts'].append({'idx': int(s_m.group(1)), 'val': float(s_m.group(2)), 'x': x_cad})
-                            if a_m: c['a_texts'].append({'idx': int(a_m.group(1)), 'val': float(a_m.group(2)), 'x': x_cad})
+                            if s_m: c['s_texts'].append({'idx': int(s_m.group(1)), 'val': float(s_m.group(2)), 'x': x_cad, 'y': y_cad})
+                            if a_m: c['a_texts'].append({'idx': int(a_m.group(1)), 'val': float(a_m.group(2)), 'x': x_cad, 'y': y_cad})
+                        break
+            
+            # فلترة الخطوط (Frames & Struts)
+            elif dxftype == 'LINE':
+                x1, y1 = e.dxf.start.x / 1000.0, e.dxf.start.y / 1000.0
+                x2, y2 = e.dxf.end.x / 1000.0, e.dxf.end.y / 1000.0
+                mid_x = (x1 + x2) / 2.0
+                
+                for c in cases_raw:
+                    if c['min_x'] <= mid_x <= c['max_x']:
+                        if layer == layer_frame:
+                            c['frames'].append({'x1': x1, 'y1': y1, 'x2': x2, 'y2': y2})
+                        elif layer == layer_strut:
+                            c['struts'].append({'x1': x1, 'y1': y1, 'x2': x2, 'y2': y2})
                         break
 
+        # معالجة كل حالة وتحويلها لبيانات FEA
         processed_cases = []
         for c_idx, c in enumerate(cases_raw):
-            if not c['s_texts']: continue
-            
-            c['s_texts'].sort(key=lambda item: item['idx'])
-            sys_start_x = min([t['x'] for t in c['s_texts']] + [p['x'] for p in c['points']] + [sp['x'] for sp in c['supports']])
+            if not c['frames']: continue
             
             base_segments = []
-            loads = []
-            x_curr = 0.0
-            
-            for i, s_dict in enumerate(c['s_texts']):
-                L = s_dict['val']
-                s_num = s_dict['idx']
-                seg = {
-                    'name': f"S{s_num}", 'master_idx': i, 'type': 'Straight Line', 'Shape Type': 'Straight Line',
-                    'L': L, 'is_dxf': True, 'abs_p1': (x_curr, 0.0), 'abs_p2': (x_curr + L, 0.0)
-                }
-                base_segments.append(seg)
-                
-                # البحث عن المساحة الموازية وتوليد حمل موزع (Dead Load)
-                match_a = next((a for a in c['a_texts'] if a['idx'] == s_num), None)
-                if match_a:
-                    area = match_a['val']
-                    if L > 1e-4:
-                        w_val = (area * conc_density * loaded_width) / L
-                        loads.append({
-                            'seg_idx': i, 'category': 'Dead Load', 'type': 'Uniform',
-                            'dir': 'Global Y (Vertical)', 'start': 0.0, 'end': L,
-                            'w1': -w_val, 'w2': -w_val # للأسفل
-                        })
-                x_curr += L
-                
-            mapped_supps = []
-            for i, sup in enumerate(c['supports']):
-                local_x = sup['x'] - sys_start_x
-                mapped_supps.append({
-                    'node': i, 'x': local_x, 'y': 0.0, 
-                    'type': 'Hinged' if i == 0 else 'Roller', 'angle': 0.0
+            for i, line in enumerate(c['frames']):
+                L = math.hypot(line['x2'] - line['x1'], line['y2'] - line['y1'])
+                base_segments.append({
+                    'name': f"F{i+1}", 'master_idx': i, 'type': 'Straight Line', 'Shape Type': 'Straight Line',
+                    'L': L, 'is_dxf': True, 'abs_p1': (line['x1'], line['y1']), 'abs_p2': (line['x2'], line['y2'])
                 })
+                
+            loads = []
+            # دمج الـ S texts مع الـ Frames
+            for s_txt in c['s_texts']:
+                min_d, best_idx, _ = get_closest_segment_exact((s_txt['x'], s_txt['y']), base_segments)
+                if min_d < 2.0: # حد أقصى للبحث عن الخط
+                    base_segments[best_idx]['name'] = f"S{s_txt['idx']}"
+                    
+                    a_txt = next((a for a in c['a_texts'] if a['idx'] == s_txt['idx']), None)
+                    if a_txt:
+                        area = a_txt['val']
+                        s_len = s_txt['val'] 
+                        if s_len > 1e-4:
+                            w_val = (area * conc_density * loaded_width) / s_len
+                            loads.append({
+                                'seg_idx': best_idx, 'category': 'Dead Load', 'type': 'Uniform',
+                                'dir': 'Global Y (Vertical)', 'start': 0.0, 'end': base_segments[best_idx]['L'],
+                                'w1': -abs(w_val), 'w2': -abs(w_val) # إجبار لأسفل Z/Y Negative
+                            })
+                            
+            struts_mapped = []
+            for line in c['struts']:
+                if line['y1'] > line['y2']: tx, ty, bx, by = line['x1'], line['y1'], line['x2'], line['y2']
+                else: tx, ty, bx, by = line['x2'], line['y2'], line['x1'], line['y1']
+                struts_mapped.append({'tx': tx, 'ty': ty, 'bx': bx, 'by': by, 'sec': list(STRUTS_DB.keys())[0] if STRUTS_DB else "PPH"})
+                
+            supps_mapped = []
+            for i, sup in enumerate(c['supports']):
+                supps_mapped.append({'node': i, 'x': sup['x'], 'y': sup['y'], 'type': 'Hinged' if i == 0 else 'Roller', 'angle': 0.0})
                 
             processed_cases.append({
                 'title': f"Case {c_idx+1}",
                 'segments': base_segments,
-                'supports': mapped_supps,
+                'struts': struts_mapped,
+                'supports': supps_mapped,
+                'cut_points': c['cut_points'],
                 'loads': loads
             })
             
@@ -203,13 +245,13 @@ def parse_dxf_bridge_cases(file_bytes, loaded_width, conc_density):
             except: pass
 
 # =========================================================
-# 2. Meshing & FEA Matrix Engine
+# 2. Meshing & FEA Matrix Engine (True 2D Frame)
 # =========================================================
-def build_chain_mesh(segments, sec_props, loads, supports, mesh_size=0.25):
+def build_chain_mesh(segments, sec_props, loads, struts, supports, cut_points, mesh_size=0.50):
     nodes = []
     elements = []
     nodal_loads = []
-    node_tol = 0.05 
+    node_tol = 0.01 
     
     def get_or_add_node(x, y):
         for i, n in enumerate(nodes):
@@ -220,21 +262,43 @@ def build_chain_mesh(segments, sec_props, loads, supports, mesh_size=0.25):
     support_injections = {i: [] for i in range(len(segments))}
     supports_list_out = []
     
+    # ربط الركائز (Supports)
     for sup in supports:
         sx, sy = sup['x'], sup['y']
-        min_d, w_seg, w_s = 999.0, 0, 0.0
-        for i, seg in enumerate(segments):
-            p1, p2 = np.array(seg['abs_p1']), np.array(seg['abs_p2'])
-            v, w = p2 - p1, np.array([sx, sy]) - p1
-            c2 = np.dot(v, v)
-            ratio = max(0.0, min(1.0, np.dot(w, v) / c2 if c2 > 1e-6 else 0.0))
-            d = np.linalg.norm(np.array([sx, sy]) - (p1 + ratio * v))
-            if d < min_d: min_d, w_seg, w_s = d, i, ratio * seg['L']
-            
+        min_d, w_seg, w_s = get_closest_segment_exact((sx, sy), segments)
         if min_d < 0.30: support_injections[w_seg].append(w_s)
         nid = get_or_add_node(sx, sy)
         supports_list_out.append({'node': nid, 'type': sup.get('type', 'Roller'), 'angle': sup.get('angle', 0.0)})
 
+    # ربط نقط القطع (TEXT_DATA points)
+    for cp in cut_points:
+        min_d, w_seg, w_s = get_closest_segment_exact((cp['x'], cp['y']), segments)
+        if min_d < 0.30: support_injections[w_seg].append(w_s)
+        get_or_add_node(cp['x'], cp['y'])
+
+    # ربط وتوليد النهايز (Struts)
+    for st_idx, st_item in enumerate(struts):
+        tx, ty, bx, by = st_item['tx'], st_item['ty'], st_item['bx'], st_item['by']
+        
+        dt, wt_seg, wt_s = get_closest_segment_exact((tx, ty), segments)
+        if dt < 0.30: 
+            support_injections[wt_seg].append(wt_s)
+            tx, ty, _ = eval_seg_point(segments[wt_seg], wt_s)
+            
+        db, wb_seg, wb_s = get_closest_segment_exact((bx, by), segments)
+        if db < 0.30: 
+            support_injections[wb_seg].append(wb_s)
+            bx, by, _ = eval_seg_point(segments[wb_seg], wb_s)
+            
+        top_node = get_or_add_node(tx, ty)
+        bot_node = get_or_add_node(bx, by)
+        
+        elements.append({
+            'type': 'truss', 'group': 'strut', 'sec': st_item.get('sec', 'Unknown'),
+            'n1': bot_node, 'n2': top_node, 'E': 21000000.0, 'A': 0.001
+        })
+
+    # بناء الفريمات (Main Members)
     for i, seg in enumerate(segments):
         L = seg['L']
         key_s_vals = [0.0, L] + support_injections[i]
@@ -290,21 +354,28 @@ def solve_fea_engine(nodes, elements, nodal_loads, supports_list):
         E, A, I = el['E'], el['A'], el.get('I', 0.00005)
         
         T = np.array([[c, s, 0, 0, 0, 0], [-s, c, 0, 0, 0, 0], [0, 0, 1, 0, 0, 0], [0, 0, 0, c, s, 0], [0, 0, 0, -s, c, 0], [0, 0, 0, 0, 0, 1]])
-        k_loc = np.array([
-            [E*A/L, 0, 0, -E*A/L, 0, 0], 
-            [0, 12*E*I/L**3, 6*E*I/L**2, 0, -12*E*I/L**3, 6*E*I/L**2],
-            [0, 6*E*I/L**2, 4*E*I/L, 0, -6*E*I/L**2, 2*E*I/L], 
-            [-E*A/L, 0, 0, E*A/L, 0, 0],
-            [0, -12*E*I/L**3, -6*E*I/L**2, 0, 12*E*I/L**3, -6*E*I/L**2], 
-            [0, 6*E*I/L**2, 2*E*I/L, 0, -6*E*I/L**2, 4*E*I/L]
-        ])
         
-        px1, py1, px2, py2 = el.get('px1',0), el.get('py1',0), el.get('px2',0), el.get('py2',0)
-        f_loc = np.array([(2*px1+px2)*L/6, (7*py1+3*py2)*L/20, (3*py1+2*py2)*L**2/60, (px1+2*px2)*L/6, (3*py1+7*py2)*L/20, -(2*py1+3*py2)*L**2/60])
-        f_glob = T.T @ f_loc
-        dof = [3*n1, 3*n1+1, 3*n1+2, 3*n2, 3*n2+1, 3*n2+2]
-        for r in range(6): F[dof[r]] += f_glob[r]
+        if el['type'] == 'truss':
+            k_loc = np.zeros((6, 6))
+            k_loc[0, 0] = E * A / L; k_loc[3, 3] = E * A / L
+            k_loc[0, 3] = -E * A / L; k_loc[3, 0] = -E * A / L
+        else:
+            k_loc = np.array([
+                [E*A/L, 0, 0, -E*A/L, 0, 0], 
+                [0, 12*E*I/L**3, 6*E*I/L**2, 0, -12*E*I/L**3, 6*E*I/L**2],
+                [0, 6*E*I/L**2, 4*E*I/L, 0, -6*E*I/L**2, 2*E*I/L], 
+                [-E*A/L, 0, 0, E*A/L, 0, 0],
+                [0, -12*E*I/L**3, -6*E*I/L**2, 0, 12*E*I/L**3, -6*E*I/L**2], 
+                [0, 6*E*I/L**2, 2*E*I/L, 0, -6*E*I/L**2, 4*E*I/L]
+            ])
+            px1, py1, px2, py2 = el.get('px1',0), el.get('py1',0), el.get('px2',0), el.get('py2',0)
+            f_loc = np.array([(2*px1+px2)*L/6, (7*py1+3*py2)*L/20, (3*py1+2*py2)*L**2/60, (px1+2*px2)*L/6, (3*py1+7*py2)*L/20, -(2*py1+3*py2)*L**2/60])
+            f_glob = T.T @ f_loc
+            dof = [3*n1, 3*n1+1, 3*n1+2, 3*n2, 3*n2+1, 3*n2+2]
+            for r in range(6): F[dof[r]] += f_glob[r]
+            
         k_glob = T.T @ k_loc @ T
+        dof = [3*n1, 3*n1+1, 3*n1+2, 3*n2, 3*n2+1, 3*n2+2]
         for r in range(6):
             for col in range(6): K[dof[r], dof[col]] += k_glob[r, col]
                 
@@ -340,17 +411,24 @@ def solve_fea_engine(nodes, elements, nodal_loads, supports_list):
         u_loc = T @ u_glob
         el['internal'] = {'u_loc': u_loc}
         
-        px1, py1, px2, py2 = el.get('px1',0), el.get('py1',0), el.get('px2',0), el.get('py2',0)
-        f_loc = np.array([(2*px1+px2)*el['L']/6, (7*py1+3*py2)*el['L']/20, (3*py1+2*py2)*el['L']**2/60, (px1+2*px2)*el['L']/6, (3*py1+7*py2)*el['L']/20, -(2*py1+3*py2)*el['L']**2/60])
-        f_end = np.array([[el['E']*el['A']/el['L'],0,0,-el['E']*el['A']/el['L'],0,0], [0,12*el['E']*el.get('I')/el['L']**3,6*el['E']*el.get('I')/el['L']**2,0,-12*el['E']*el.get('I')/el['L']**3,6*el['E']*el.get('I')/el['L']**2], [0,6*el['E']*el.get('I')/el['L']**2,4*el['E']*el.get('I')/el['L'],0,-6*el['E']*el.get('I')/el['L']**2,2*el['E']*el.get('I')/el['L']], [-el['E']*el['A']/el['L'],0,0,el['E']*el['A']/el['L'],0,0], [0,-12*el['E']*el.get('I')/el['L']**3,-6*el['E']*el.get('I')/el['L']**2,0,12*el['E']*el.get('I')/el['L']**3,-6*el['E']*el.get('I')/el['L']**2], [0,6*el['E']*el.get('I')/el['L']**2,2*el['E']*el.get('I')/el['L'],0,-6*el['E']*el.get('I')/el['L']**2,4*el['E']*el.get('I')/el['L']]]) @ u_loc - f_loc
-        
-        xs = np.linspace(0, el['L'], 51)
-        el['internal'].update({
-            'N': -f_end[0] - (px1*xs + (px2-px1)*xs**2/(2*el['L'])), 
-            'V': f_end[1] + (py1*xs + (py2-py1)*xs**2/(2*el['L'])), 
-            'M': -f_end[2] + f_end[1]*xs + py1*xs**2/2.0 + (py2-py1)*xs**3/(6*el['L']), 
-            'x': xs
-        })
+        if el['type'] == 'truss':
+            N_val = (el['E'] * el['A'] / el['L']) * (u_loc[3] - u_loc[0])
+            xs = np.linspace(0, el['L'], 51)
+            el['internal'].update({'N': np.full_like(xs, N_val), 'V': np.zeros_like(xs), 'M': np.zeros_like(xs), 'x': xs})
+        else:
+            k_loc = np.array([
+                [el['E']*el['A']/el['L'],0,0,-el['E']*el['A']/el['L'],0,0], [0,12*el['E']*el.get('I')/el['L']**3,6*el['E']*el.get('I')/el['L']**2,0,-12*el['E']*el.get('I')/el['L']**3,6*el['E']*el.get('I')/el['L']**2], [0,6*el['E']*el.get('I')/el['L']**2,4*el['E']*el.get('I')/el['L'],0,-6*el['E']*el.get('I')/el['L']**2,2*el['E']*el.get('I')/el['L']], [-el['E']*el['A']/el['L'],0,0,el['E']*el['A']/el['L'],0,0], [0,-12*el['E']*el.get('I')/el['L']**3,-6*el['E']*el.get('I')/el['L']**2,0,12*el['E']*el.get('I')/el['L']**3,-6*el['E']*el.get('I')/el['L']**2], [0,6*el['E']*el.get('I')/el['L']**2,2*el['E']*el.get('I')/el['L'],0,-6*el['E']*el.get('I')/el['L']**2,4*el['E']*el.get('I')/el['L']]])
+            px1, py1, px2, py2 = el.get('px1',0), el.get('py1',0), el.get('px2',0), el.get('py2',0)
+            f_loc = np.array([(2*px1+px2)*el['L']/6, (7*py1+3*py2)*el['L']/20, (3*py1+2*py2)*el['L']**2/60, (px1+2*px2)*el['L']/6, (3*py1+7*py2)*el['L']/20, -(2*py1+3*py2)*el['L']**2/60])
+            f_end = k_loc @ u_loc - f_loc
+            
+            xs = np.linspace(0, el['L'], 51)
+            el['internal'].update({
+                'N': -f_end[0] - (px1*xs + (px2-px1)*xs**2/(2*el['L'])), 
+                'V': f_end[1] + (py1*xs + (py2-py1)*xs**2/(2*el['L'])), 
+                'M': -f_end[2] + f_end[1]*xs + py1*xs**2/2.0 + (py2-py1)*xs**3/(6*el['L']), 
+                'x': xs
+            })
             
     return U, R_reactions
 
@@ -360,7 +438,10 @@ def solve_fea_engine(nodes, elements, nodal_loads, supports_list):
 def draw_base_geometry(ax, nodes, elements, supports_list, segments, show_names=False):
     for el in elements:
         n1, n2 = nodes[el['n1']], nodes[el['n2']]
-        ax.plot([n1[0], n2[0]], [n1[1], n2[1]], color='royalblue', linestyle='-', linewidth=1.5, zorder=1)
+        if el['type'] == 'truss':
+            ax.plot([n1[0], n2[0]], [n1[1], n2[1]], color='red', linestyle='-', linewidth=0.8, zorder=1)
+        else:
+            ax.plot([n1[0], n2[0]], [n1[1], n2[1]], color='royalblue', linestyle='-', linewidth=1.5, zorder=1)
             
     for i, sup in enumerate(supports_list):
         x, y = nodes[sup['node']][0], nodes[sup['node']][1]
@@ -394,8 +475,9 @@ def plot_sap2000_diagrams(nodes, elements, R_reactions, scales, supports_list, l
     
     # 1. Loads Diagram
     fig_ld, ax_ld = plt.subplots(figsize=(7, 4.5))
-    ax_ld.set_aspect('equal', adjustable='box'); ax_ld.axis('off')
+    ax_ld.set_aspect('equal', adjustable='datalim'); ax_ld.axis('off')
     draw_base_geometry(ax_ld, nodes, elements, supports_list, segments, show_names=True)
+    
     for ld in loads:
         i = ld.get('seg_idx', 0)
         w1, w2 = ld.get('w1', 0.0), ld.get('w2', 0.0)
@@ -411,11 +493,12 @@ def plot_sap2000_diagrams(nodes, elements, R_reactions, scales, supports_list, l
         poly_pts.extend(top_pts[::-1])
         if len(poly_pts) > 2:
             ax_ld.add_patch(Polygon(poly_pts, facecolor='blue', edgecolor='blue', alpha=0.15, lw=0.8, zorder=2))
+            
     figs_dict['L'] = safe_render_fig(fig_ld)
     
     # 2. Reactions
     fig_r, ax_r = plt.subplots(figsize=(7, 4.5))
-    ax_r.set_aspect('equal', adjustable='box'); ax_r.axis('off')
+    ax_r.set_aspect('equal', adjustable='datalim'); ax_r.axis('off')
     draw_base_geometry(ax_r, nodes, elements, supports_list, segments)
     for sup in supports_list:
         n, ang = sup['node'], math.radians(sup.get('angle', 0.0))
@@ -426,31 +509,38 @@ def plot_sap2000_diagrams(nodes, elements, R_reactions, scales, supports_list, l
         else:
             draw_reaction_arrow(ax_r, x, y, R_loc_x, math.cos(ang), math.sin(ang))
             draw_reaction_arrow(ax_r, x, y, R_loc_y, -math.sin(ang), math.cos(ang))
+            
     figs_dict['R'] = safe_render_fig(fig_r)
     
-    # 3. Forces (N, V, M) - 💡 FIXED THE TYPO HERE (n1, n2 defined explicitly)
+    # 3. Forces (N, V, M) - Fixed the Typo!
     def create_force_plot(val_key, scale, c_pos, c_neg):
         fig_f, ax_f = plt.subplots(figsize=(7, 4.5))
-        ax_f.set_aspect('equal', adjustable='box'); ax_f.axis('off')
+        ax_f.set_aspect('equal', adjustable='datalim'); ax_f.axis('off')
         draw_base_geometry(ax_f, nodes, elements, supports_list, segments)
         for el in elements:
-            n1, n2 = el['n1'], el['n2'] # <--- BUG FIXED HERE
+            n1, n2 = el['n1'], el['n2'] 
             x1, y1 = nodes[n1][0], nodes[n1][1]
             x2, y2 = nodes[n2][0], nodes[n2][1]
             c, s = el.get('c', 1.0), el.get('s', 0.0)
             xs = el.get('internal', {}).get('x', [])
             vals = el.get('internal', {}).get(val_key, [])
+            
             if len(vals) == 0 or np.all(np.abs(vals) < 1e-6): continue
             plot_vals = -vals if val_key != 'N' else vals
             px, py = x1 + c*xs - s*plot_vals*scale, y1 + s*xs + c*plot_vals*scale
+            
             for k in range(len(px)-1):
                 ax_f.plot([px[k], px[k+1]], [py[k], py[k+1]], color=c_pos if vals[k] >= 0 else c_neg, lw=0.8)
             ax_f.plot([x1, px[0]], [y1, py[0]], color=c_pos if vals[0]>=0 else c_neg, lw=0.8)
             ax_f.plot([x2, px[-1]], [y2, py[-1]], color=c_pos if vals[-1]>=0 else c_neg, lw=0.8)
+            
             mid = len(vals)//2
-            if abs(vals[mid]) > 0.1: ax_f.text(px[mid], py[mid], f"{vals[mid]:+.2f}", fontsize=6, color=c_pos if vals[mid]>=0 else c_neg, ha='center', va='center')
+            if abs(vals[mid]) > 0.1: 
+                ax_f.text(px[mid], py[mid], f"{vals[mid]:+.2f}", fontsize=6, color=c_pos if vals[mid]>=0 else c_neg, ha='center', va='center')
+                
         return safe_render_fig(fig_f)
 
+    figs_dict['N'] = create_force_plot('N', scales['N'], 'blue', 'red')
     figs_dict['V'] = create_force_plot('V', scales['V'], 'blue', 'red')
     figs_dict['M'] = create_force_plot('M', scales['M'], 'blue', 'red')
     
@@ -466,14 +556,14 @@ def generate_multi_case_report(cases_data, proj_info):
         r = p.add_run(text)
         r.font.name, r.font.size, r.font.bold, r.font.rtl = 'Arial', Pt(size), bold, False
         
-    add_line("BRIDGE FORMWORK MULTI-CASE ANALYSIS", bold=True, size=16)
+    add_line("BRIDGE FORMWORK MULTI-CASE ANALYSIS (DXF EXTRACTION)", bold=True, size=16)
     
     for case in cases_data:
         doc.add_page_break()
         add_line(f"ANALYSIS DIAGRAMS FOR {case['title'].upper()}", bold=True, size=14)
         doc.add_paragraph()
         
-        for key, label in [('L', "APPLIED LOADS & GEOMETRY"), ('M', "BENDING MOMENT DIAGRAM (kN.m)"), ('V', "SHEAR FORCE DIAGRAM (kN)"), ('R', "SUPPORT REACTIONS (kN)")]:
+        for key, label in [('L', "APPLIED LOADS & GEOMETRY"), ('N', "AXIAL FORCE DIAGRAM (kN)"), ('M', "BENDING MOMENT DIAGRAM (kN.m)"), ('V', "SHEAR FORCE DIAGRAM (kN)"), ('R', "SUPPORT REACTIONS (kN)")]:
             if key in case['img_bufs']:
                 add_line(label, bold=True, size=12)
                 p_img = doc.add_paragraph()
@@ -489,8 +579,8 @@ def generate_multi_case_report(cases_data, proj_info):
 # 4. Main UI Module
 # =========================================================
 def render_bridge_module(proj_info):
-    st.markdown("## 🌉 Bridge Formwork (DXF Multi-Case Analyzer)")
-    st.info("💡 **Smart Engine:** Upload your Bridge DXF file. The AI will extract all Tables/Cases (separated by SEPARATOR layer), read S lengths, A areas, calculate Dead Loads automatically, and run individual FEA for each Case!")
+    st.markdown("## 🌉 Bridge Formwork (True 2D DXF Multi-Case Analyzer)")
+    st.info("💡 **Smart Engine:** Upload your Bridge DXF file. The AI will extract all 2D Frames (from FRAME layer), Struts (from PUSH_PULL), Supports (from SUPPORT), and automatically assign Area loads (from TEXT_DATA) to the corresponding S segments!")
     
     c1, c2 = st.columns(2)
     loaded_width = c1.number_input("Loaded Width (m) for Load Calculation", value=1.30, step=0.05)
@@ -499,52 +589,54 @@ def render_bridge_module(proj_info):
     uploaded_dxf = st.file_uploader("📥 Upload DXF File (.dxf) with ACROW Layers", type=['dxf'])
     
     if uploaded_dxf:
-        if st.button("🚀 Process DXF & Extract Cases", type="primary", use_container_width=True):
-            with st.spinner("Parsing DXF geometry & Computing Automatic Loads..."):
+        if st.button("🚀 Process DXF & Extract 2D Cases", type="primary", use_container_width=True):
+            with st.spinner("Parsing DXF true 2D geometry & Computing Automatic Loads..."):
                 cases_data = parse_dxf_bridge_cases(uploaded_dxf.getvalue(), loaded_width, conc_density)
                 
             if cases_data:
                 st.session_state.bridge_cases = cases_data
-                st.success(f"✅ Successfully extracted {len(cases_data)} structural case(s) from the DXF!")
+                st.success(f"✅ Successfully extracted {len(cases_data)} structural 2D case(s) from the DXF!")
                 st.rerun()
             else:
-                st.error("❌ Failed to parse DXF. Please ensure layers (SUPPORT, TEXT_DATA, SEPARATOR) are correct.")
+                st.error("❌ Failed to parse DXF. Please ensure layers (FRAME, PUSH_PULL, SUPPORT, TEXT_DATA, SEPARATOR) are correct.")
 
     if 'bridge_cases' in st.session_state:
         st.markdown("### 🎛️ Customize Global Diagram Scales")
         c_s1, c_s2, c_s3 = st.columns(3)
-        sc_v = c_s1.slider("Shear Scale", 0.001, 0.050, 0.015, step=0.001)
-        sc_m = c_s2.slider("Moment Scale", 0.001, 0.100, 0.015, step=0.001)
+        sc_n = c_s1.slider("Axial Scale", 0.001, 0.050, 0.015, step=0.001)
+        sc_v = c_s2.slider("Shear Scale", 0.001, 0.050, 0.015, step=0.001)
+        sc_m = c_s3.slider("Moment Scale", 0.001, 0.100, 0.015, step=0.001)
         
-        # 💡 القطاع الموحد
         global_sec = {'name': "Soldier U100", 'E': 2100.0, 'A': 34.3 / 10000.0, 'I': 412.0 / 100000000.0, 'Mall': 13.1, 'Qall': 100.8}
-        
         tabs = st.tabs([c['title'] for c in st.session_state.bridge_cases])
-        
         all_cases_ready = []
         
         for i, tab in enumerate(tabs):
             case = st.session_state.bridge_cases[i]
             with tab:
                 st.markdown(f"#### {case['title']} Data Summary")
-                st.write(f"- **Extracted Segments:** {len(case['segments'])}")
+                st.write(f"- **Extracted Frame Lines:** {len(case['segments'])}")
+                st.write(f"- **Extracted Struts:** {len(case['struts'])}")
                 st.write(f"- **Mapped Supports:** {len(case['supports'])}")
                 st.write(f"- **Auto-Calculated Loads:** {len(case['loads'])}")
                 
-                with st.spinner(f"Solving FEA for {case['title']}..."):
-                    nodes, elements, nodal_loads, supports_list = build_chain_mesh(case['segments'], global_sec, case['loads'], case['supports'])
+                with st.spinner(f"Solving True 2D FEA for {case['title']}..."):
+                    nodes, elements, nodal_loads, supports_list = build_chain_mesh(case['segments'], global_sec, case['loads'], case['struts'], case['supports'], case['cut_points'])
                     U, R = solve_fea_engine(nodes, elements, nodal_loads, supports_list)
                     
-                    img_bufs = plot_sap2000_diagrams(nodes, elements, R, {'V': sc_v, 'M': sc_m}, supports_list, case['loads'], case['segments'])
+                    img_bufs = plot_sap2000_diagrams(nodes, elements, R, {'N': sc_n, 'V': sc_v, 'M': sc_m}, supports_list, case['loads'], case['segments'])
                     case['img_bufs'] = img_bufs
                     
                     all_cases_ready.append(case)
                     
-                    st.image(img_bufs['L'], caption="Applied Loads & Geometry")
-                    cc1, cc2 = st.columns(2)
-                    cc1.image(img_bufs['M'], caption="Bending Moment (kN.m)")
-                    cc2.image(img_bufs['V'], caption="Shear Force (kN)")
-                    st.image(img_bufs['R'], caption="Support Reactions (kN)")
+                    st.image(img_bufs['L'], caption="Applied Loads & Geometry (True 2D)")
+                    c_p1, c_p2 = st.columns(2)
+                    c_p1.image(img_bufs['M'], caption="Bending Moment (kN.m)")
+                    c_p2.image(img_bufs['V'], caption="Shear Force (kN)")
+                    
+                    c_p3, c_p4 = st.columns(2)
+                    c_p3.image(img_bufs['N'], caption="Axial Force (kN)")
+                    c_p4.image(img_bufs['R'], caption="Support Reactions (kN)")
                     
         st.markdown("---")
         if st.button("📥 Download Multi-Case Word Report", type="primary", use_container_width=True):
